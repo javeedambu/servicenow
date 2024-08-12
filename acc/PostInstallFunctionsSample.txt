@@ -1,0 +1,94 @@
+function InstallService()
+	Dim WshShell, binPath, serviceConf, serviceLog, serviceDisplayName, serviceName, serviceDescription, cmd, userName, userString, password, logSafeFullStr
+
+	LogToFile "InstallService","start" ,"ins"
+	serviceName = Session.Property("SERVICE_NAME")
+	binPath = Session.Property("SERVICE_BIN_PATH")
+	serviceConf = Session.Property("SERVICE_CONF_PATH")
+	serviceLog = Session.Property("SERVICE_LOG_PATH")
+	serviceDisplayName = Session.Property("SERVICE_DISPLAY_NAME")
+	serviceDescription = Session.Property("SERVICE_DESCRIPTION")
+	userName = Session.Property("LOCALUSERNAME")
+	password = Session.Property("LOCALUSERPASSWORD")
+	isDomain = Session.Property("ISDOMAIN")
+
+    ' Establish user account for creating ACC service
+	if (userName <> "SYSTEM") Then
+		if (isDomain) Then
+			domain = Session.Property("DOMAIN")
+			userString = domain & "\" & userName
+		elseif (userName = "NT AUTHORITY\LOCAL SERVICE") Then
+			userString = userName
+		else
+			userString = ".\" & userName & ""
+		end if
+	end if
+
+	' Set exec command string for service based on parameters
+	execPath = """" & binPath & """ service run """ & serviceConf & """ """ & serviceLog & """"
+
+	Const OWN_PROCESS = 16
+	Const NOT_INTERACTIVE = False
+	Const NORMAL_ERROR_CONTROL = 2
+	Set objWMIService = GetObject("winmgmts:\\127.0.0.1\root\cimv2")
+	Set objService = objWMIService.Get("Win32_BaseService")
+
+	LogToFile "Going to install service with user "&userName,"info" ,"ins"
+
+	' Handle gmsa special since it needs to be created with no password and cannot be done directly
+	if (userName = "SYSTEM") Or (Right(userName, 1) = "$") Then
+		errReturn = objService.Create(serviceName ,serviceDisplayName , execPath, OWN_PROCESS, NORMAL_ERROR_CONTROL, "Automatic", NOT_INTERACTIVE  )
+	elseif (userName = "NT AUTHORITY\LOCAL SERVICE") Then
+		errReturn = objService.Create(serviceName ,serviceDisplayName , execPath, OWN_PROCESS, NORMAL_ERROR_CONTROL, "Automatic", NOT_INTERACTIVE, userString, ""  )
+	else
+		errReturn = objService.Create(serviceName ,serviceDisplayName , execPath, OWN_PROCESS, NORMAL_ERROR_CONTROL, "Automatic", NOT_INTERACTIVE, userString, password)
+	end if
+
+	' If creating service was not success, stop installation
+	if errReturn <> 0 Then
+		LogToFile "Unable to create service with "&userString,"error" ,"ins"
+		LogToFile "ErrorCode::"&errReturn, "error", "ins"
+		InstallService = 3
+		Exit Function
+	End if
+
+	Set WshShell = CreateObject("WScript.Shell")
+
+	' When gmsa account use direct command to change the service user account
+	if (Right(userName, 1) = "$") Then
+		objStr = " obj= """& domain & "\" & userName & """"
+		cmd = "cmd.exe /c sc config " & serviceName & objStr
+		WshShell.run cmd, 0, false
+	end if
+
+	LogToFile "Updating service description, auto-start and failure settings","info" ,"ins"
+	cmd = "cmd.exe /c sc description " & serviceName & " """ & serviceDescription & """"
+	WshShell.run cmd, 0, false
+	cmd = "cmd.exe /c SC failure " & serviceName & " reset= 0 actions= restart/60000ms/restart/60000ms/restart/60000ms"
+	WshShell.run cmd, 0, false
+	cmd = "cmd.exe /c sc config " & serviceName & " start= ""delayed-auto"""
+	WshShell.run cmd, 0, false
+
+	LogToFile "After service was created with user "&userName,"info" ,"ins"
+
+	startService = Session.Property("START_SERVICE")
+	if startService <> "False" then
+		cmd =  "cmd.exe /c sc start " & serviceName
+		Set WshShellExec = WshShell.Exec(cmd)
+	    strOutput = WshShellExec.StdOut.ReadAll
+	    If InStr(strOutput, "FAILED") <> 0 Then
+	        startIndex = InStr(strOutput, ":")
+	        dim systemError
+	        If startIndex <> 0 Then
+	            systemError =  Mid(strOutput, startIndex+1)
+	        End If
+	        LogToFile "Service Starting ended with failure: "&systemError,"error_d","ins"
+	        InstallService = 3
+	        Exit Function
+	    End If
+	    LogToFile "After service started","info" ,"ins"
+		Set WshShell = Nothing
+	end if
+
+	LogToFile "InstallService","end" ,"ins"
+end function
