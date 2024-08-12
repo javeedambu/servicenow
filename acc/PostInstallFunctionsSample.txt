@@ -1,3 +1,551 @@
+Const ADS_SECURE_AUTHENTICATION = 1
+function PostInstallDo()
+    LogToFile "********************************************************************** PostInstallDo **********************************************************************","info", "ins"
+	PostInstallDo = 1
+
+	HandleAgentConfFiles()
+	RemoveInheritance()
+	SetAllowListReadOnly()
+	RunAssocRubyCommand()
+	res = InstallService()
+    if(res = "3") Then
+    	PostInstallDo = 3
+    End If
+    LogToFile "Installation ","end" ,"ins"
+end function
+
+function PreUnInstallDo()
+	RemoveLogFile("u") ' Remoes the Agent_UnInstall.log file
+    LogToFile "********************************************************************** PreUnInstallDo **********************************************************************","info", "u"
+    StopService(True)
+end function
+
+function PostUnInstallDo()
+    LogToFile "********************************************************************** PostUnInstallDo **********************************************************************","info", "u"
+	RemoveService()
+	RemoveUser()
+	RemoveGroup()
+	LogToFile "UnInstallation ","end" ,"u"
+end function
+
+'Upgrade. Restore backed up agent conf files and start service
+function PostUpgradeDo()
+    LogToFile "********************************************************************** PostUpgradeDo **********************************************************************","info", "ins"
+	LogToFile "PostUpgradeDo","start" ,"ins"
+    RemoveOldUsersProfile()
+	'Restore backed up files
+	RestoreAgentConfiguration()
+	RemoveInheritance()
+	SetAllowListReadOnly()
+	RunAssocRubyCommand()
+    'Start service.
+	HandleService "true", False
+end function
+
+' Upgrade. Stop service and backup agent configuration files
+function PreUpgradeDo()
+    LogToFile "********************************************************************** PreUpgradeDo **********************************************************************","info", "ins"
+	LogToFile "PreUpgradeDo","start" ,"ins"
+
+    ' This is specifially for selective-upgrade with System account
+    if (Session.Property("UPGRADEUSER") <> "") Then
+        LogToFile "Running upgrade as " & Session.Property("UPGRADEUSER") ,"info" ,"ins"
+        Session.Property("LOCALUSERNAME") = Session.Property("UPGRADEUSER")
+    end if
+
+	'Stop service
+	HandleService "false", False
+
+	'Backup acc.yml
+	'Backup agent key store
+	'Backup agent decriptor.
+	BackupAgentConfiguration()
+end function
+
+function HandleUser ()
+	' this method handles all types of user initializations: 1. Silent (if) 2. Default (elseif ) 3. Existing (else)
+	usrName = Session.Property("LOCALUSERNAME")
+	LogToFile "HandleUser "& usrName ,"start" ,"ins"
+
+	' this method handles all types of user initializations: 1. Silent (if) 2. Default (elseif ) 3. Existing (else)
+	if(usrName = "") then
+		'LOCALUSERNAME was not initialized ==> this is silent installation
+		RemoveLogFile ("ins")
+		Session.Property("LOCALUSERNAME") = Session.Property("DEFAULTUSERNAME")
+		Session.Property("ISDOMAIN") = "0"
+		AddUser(Session.Property("LOCALUSERNAME"))
+	elseif(usrName = Session.Property("DEFAULTUSERNAME")) then
+		'LOCALUSERNAME was initialized and it is DEFAULTUSERNAME ==> servicenow
+		Session.Property("ISDOMAIN") = "0"
+		AddUser(usrName)
+    elseif(usrName = "SYSTEM") then
+        Session.Property("ISDOMAIN") = "0"
+        LogToFile "User opted-in to run the agent service as system" ,"info" ,"ins"
+	elseif(usrName = "NT AUTHORITY\LOCAL SERVICE" or usrName = "LOCALSERVICE") then
+		' translate installer convenient name LOCALSERVICE to the actual Windows built-in username "NT AUTHORITY\LOCAL SERVICE"
+		Session.Property("LOCALUSERNAME") = "NT AUTHORITY\LOCAL SERVICE"
+		Session.Property("FULLUSERNAME") = "NT AUTHORITY\LOCAL SERVICE"
+        Session.Property("ISDOMAIN") = "0"
+        LogToFile "User opted-in to run the agent service as Local Service" ,"info" ,"ins"
+	else
+		'LOCALUSERNAME was initialized and it is not DEFAULTUSERNAME ==> existing user
+		LogToFile "User opted-in to run the agent service as existing user "&usrName ,"info" ,"ins"
+		domainArray = ParseDomain (usrName)
+		isDomain = domainArray(0)
+		localUserName = domainArray(1)
+		domain = domainArray(2)
+
+		if (isDomain = "1") then
+			LogToFile "Existing user is a domain user","info" ,"ins"
+			Session.Property("ISDOMAIN") = "1"
+			Session.Property("LOCALUSERNAME") = localUserName
+			Session.Property("DOMAIN") = domain
+		else
+			LogToFile "Existing user is a local user","info" ,"ins"
+			Session.Property("ISDOMAIN") = "0"
+		end if
+		AddUserToLocalGroup (usrName)
+	end if
+
+	if (Session.Property("FULLUSERNAME") = "") then
+		' in case we did not run ValidateCredentials, save the full username (domain\user)
+		LogToFile "Setting FULLUSERNAME to be " & Session.Property("LOCALUSERNAME") ,"info" ,"ins"
+		Session.Property("FULLUSERNAME") = Session.Property("LOCALUSERNAME") ' This will save domain\user in the session as LOCALUSERNAME will be just the username after CheckCredentialsDomain() method
+    end if
+
+    LogToFile "HandleUser" ,"end" ,"ins"
+end function
+
+function ValidateCredentials()
+	dim isLocal, isDomain, domain, res, usrName, password, userType
+	RemoveLogFile ("ins")
+	usrName = Session.Property("LOCALUSERNAME")
+
+    if(usrName = "SYSTEM") then
+        LogToFile "Skipping credentials validation for user SYSTEM" ,"info" ,"ins"
+        exit function
+	end if
+
+	if(usrName = "NT AUTHORITY\LOCAL SERVICE" or usrName = "LOCALSERVICE") then
+		LogToFile "Skipping credentials validation for user LOCAL SERVICE" ,"info" ,"ins"
+		exit function
+	end if
+
+	' Managed Service Accounts (MSA) and Group Managed Service Accounts (gMSA) end with a $
+	' these accounts do not require passwords so skip validation
+	if (Right(usrName, 1) = "$") then
+		LogToFile "Skipping credentials validation for Managed Service Account "& usrName,"info" ,"ins"
+		exit function
+	end if
+
+	LogToFile "ValidateCredentials "& usrName ,"start" ,"ins"
+
+    LogToFile "Setting FULLUSERNAME=" & Session.Property("LOCALUSERNAME") ,"info" ,"ins"
+    Session.Property("FULLUSERNAME") = Session.Property("LOCALUSERNAME") ' This will save domain\user in the session as LOCALUSERNAME will be just the username after CheckCredentialsDomain() method
+
+	If usrName = "" Then
+		FailValidate "ValidateCredentials failed because of missing credentials input","1"
+		exit function
+    End If
+
+	domainArray = ParseDomain (usrName)
+	isDomain = domainArray(0)
+	usrName = domainArray(1)
+	domain = domainArray(2)
+
+	If (isDomain = "2") Then
+		FailValidate "ValidateCredentials failed because user does not exist","3"
+		'ValidateCredentials = 0
+		exit function
+    End If
+
+	password = Session.Property("LOCALUSERPASSWORD")
+	if(isDomain = "0") then
+		LogToFile usrName &" is local ","info" ,"ins"
+		res = CheckCredentialsLocal(usrName,password)
+	else
+		LogToFile usrName &" is not local ","info" ,"ins"
+		res = CheckCredentialsDomain(domain, usrName, password)
+	end if
+
+	if(res) then
+		Session.Property("CREATE_USER_FAILED") = "100"
+	else
+		FailValidate "ValidateCredentials failed with user: "& usrName , "2"
+		exit function
+	end if
+
+	LogToFile "ValidateCredentials "& usrName ,"end" ,"ins"
+end function
+
+function ParseDomain(usrName)
+	LogToFile "ParseDomain "& usrName ,"start" ,"ins"
+	Set objRE = New RegExp
+	'check if the username contain \
+	' if it does we will split it to user & domain
+	With objRE
+		.Pattern    = "(.*)\\(.*)"
+		.IgnoreCase = True
+		.Global     = False
+	End With
+
+	Set objMatch = objRE.Execute( usrName )
+
+	If objMatch.Count = 1 Then
+		LogToFile "user account is domain", "info" ,"ins"
+		ParseDomain = array("1", objMatch.Item(0).Submatches(1), objMatch.Item(0).Submatches(0))
+		LogToFile "ParseDomain "& usrName ,"end" ,"ins"
+		exit function
+	end if
+
+	userType = CheckIfUserIsLocalOrDomain(usrName)
+	LogToFile userType &" is userType ","info" ,"ins"
+	if(userType = 1) then
+		LogToFile "CheckIfUserIsLocalOrDomain returned that user account is local", "info" ,"ins"
+		ParseDomain = array("0", usrName, "")
+		LogToFile "ParseDomain "& usrName ,"end" ,"ins"
+		exit function
+	end if
+
+	if(userType = 2) then
+		LogToFile "CheckIfUserIsLocalOrDomain returned that user account is domain", "info" ,"ins"
+		Set objNetwork = CreateObject("WScript.Network")
+		ParseDomain = array("1", usrName, objNetwork.UserDomain)
+		LogToFile "ParseDomain "& usrName ,"end" ,"ins"
+		exit function
+	end if
+
+	LogToFile "Could not find user, setting ISDOMAIN property to 0", "info" ,"ins"
+	ParseDomain = array("2", usrName, "")
+	LogToFile "ParseDomain "& usrName ,"end" ,"ins"
+end function
+
+function FailValidate(message, error_num)
+	Session.Property("CREATE_USER_FAILED") = error_num
+	'In case the validation end with failure we want to clean
+	Session.Property("LOCALUSERNAME") = ""
+	Session.Property("LOCALUSERPASSWORD") = ""
+	LogToFile message ,"error_i" ,"ins"
+end function
+
+function CheckCredentialsDomain(domain, usrName, password)
+    if( domain = "") then
+    	Set objNetwork = CreateObject("WScript.Network")
+    	domain = objNetwork.UserDomain
+    end if
+    Set objDS = GetObject("LDAP:")
+    On Error Resume Next
+    Set objDomain = objDS.OpenDSObject("LDAP://" & domain, usrName, password, ADS_SECURE_AUTHENTICATION)
+	'err.number is 0 in case of success
+    If err.number = 0 then
+		CheckCredentialsDomain = True
+    Else
+		CheckCredentialsDomain = False
+    End If
+    On Error Goto 0
+	Set objDS = nothing
+	Set objDomain = nothing
+	LogToFile "CheckCredentialsDomain for "&usrName &" is "&CheckCredentialsDomain, "info", "ins"
+
+end function
+
+function CheckCredentialsLocal(usrName, password)
+    LogToFile "CheckCredentialsLocal","start" ,"ins"
+
+    CheckCredentialsLocal = 0
+
+    Set objNetwork = CreateObject("WScript.Network")
+    domain = objNetwork.UserDomain
+
+    Dim objIADS
+    On Error Resume Next
+    Set objIADS = GetObject("WinNT:").OpenDSObject("WinNT://" & domain & "/" & usrName & ",user", usrName, password, ADS_SECURE_AUTHENTICATION)
+
+    If err.number = 0 then
+        LogToFile "Credential set with local username " & usrName & " is working properly", "info", "ins"
+        CheckCredentialsLocal = 1
+    Else
+        LogToFile "Credential set with local username " & usrName & " did not validate", "error_i", "ins"
+    End If
+
+	LogToFile "CheckCredentialsLocal","end" ,"ins"
+end function
+
+'we want to see if the user exist in the local group or the domain
+'In case the user was not found the error code received is: -2147022676
+function CheckIfUserIsLocalOrDomain (usrName)
+	LogToFile "CheckIfUserIsLocalOrDomain for "&usrName , "start", "ins"
+	CheckIfUserIsLocalOrDomain = 0
+	Set objNetwork = CreateObject("Wscript.Network")
+
+	strComputer = objNetwork.ComputerName
+	strDomain = objNetwork.UserDomain
+	dim pathComp : pathComp = "WinNT://"&strComputer&"/"&usrName
+	dim pathDomain : pathDomain = "WinNT://"&strDomain&"/"&usrName
+
+	On Error Resume Next
+
+	Set objUser = GetObject(pathComp)
+	If Err.Number = 0 Then
+		LogToFile "user  "&usrName & " exist in the local env", "info", "ins"
+		CheckIfUserIsLocalOrDomain = 1
+	ElseIf Err.Number = -2147022676 Then
+		LogToFile "user  "&usrName & " does not exist in the local env", "info", "ins"
+		Err.Clear
+		Set objUser = GetObject(pathDomain)
+		If Err.Number = 0 Then
+			LogToFile "user  "&usrName & " exist in the domain env", "info", "ins"
+			CheckIfUserIsLocalOrDomain = 2
+		ElseIf Err.Number = -2147022676 Then
+			LogToFile "user  "&usrName & " does not exist in the domain  env as well", "info", "ins"
+		Else
+			LogToFile "The user account status could not be determined.", "info", "ins"
+		End If
+	Else
+		LogToFile "The user account status could not be determined.", "info", "ins"
+	End If
+
+	Err.Clear
+	Set objNetwork = nothing
+	Set colAccounts = nothing
+	LogToFile "CheckIfUserIsLocalOrDomain for "&usrName &" is " &CheckIfUserIsLocalOrDomain, "end", "ins"
+end function
+
+function HandleAgentConfFiles()
+	CopyAgentConfFiles()
+	EditAgentYml()
+end function
+
+function SetAllowListReadOnly()
+	setFileReadOnly(Session.Property("AGENT_ALLOWLIST_SOURCE_PATH")) 'source
+	setFileReadOnly(Session.Property("AGENT_ALLOWLIST_PATH")) 'target
+end function
+
+'
+' Sets a file to readonly
+' Readonly is applied only to the default group "ServiceNow User"
+' Status is logged into Agent Installation log file
+'
+' @param fileLocation
+' @return
+'
+function setFileReadOnly(fileLocation)
+    LogToFile "Set file as readonly "&fileLocation,"start" ,"ins"
+	userName = Session.Property("LOCALUSERNAME")
+	if (userName = "SYSTEM") then
+		LogToFile "Skipping setting file to read only for user SYSTEM", "info", "ins"
+		LogToFile "Done Setting readonly","end" ,"ins"
+		Exit Function
+	end if
+
+    Set objFSO = CreateObject("Scripting.FileSystemObject")
+    If (objFSO.FileExists(fileLocation)) Then
+        Set WshShell = CreateObject("WScript.Shell")
+        groupOrUser = Session.Property("GROUPNAME")
+
+		if (userName = "NT AUTHORITY\LOCAL SERVICE") then
+			groupOrUser = "NT AUTHORITY\LOCAL SERVICE"
+		end if
+
+        'remove all access to file for "ServiceNow user" group
+        cmdToExecute = "cmd.exe /c icacls """ & fileLocation & """ /remove:g """ & groupOrUser & """ "
+		LogToFile cmdToExecute, "info", "ins"
+        WshShell.run cmdToExecute , 0 , false
+
+        'add read only access to file for user group "servicenow User"
+        cmdToExecute = "cmd.exe /c icacls """ & fileLocation & """ /grant """ & groupOrUser & """:R"
+		LogToFile cmdToExecute, "info", "ins"
+        WshShell.run cmdToExecute , 0 , false
+
+        ' print the current permissions on file to install log
+        cmdToExcute = "cmd.exe /c icacls """ & fileLocation & """"
+		LogToFile cmdToExecute, "info", "ins"
+        Set cmdOutput = WshShell.Exec(cmdToExcute)
+        standOut = cmdOutput.StdOut.ReadAll
+        LogToFile "File permission:"""& standOut &""" ","info" ,"ins"
+    Else
+        LogToFile "File not found to setFileReadOnly","end" ,"ins"
+    End If
+	LogToFile "Done Setting readonly","end" ,"ins"
+end function
+
+'Copy acc.yml to C:\ProgramData\ServiceNow\agent-client-collector\conf
+'Copy check-allow-list.json to C:\ProgramData\ServiceNow\agent-client-collector\conf
+function CopyAgentConfFiles()
+	Dim WshShell, source, target, cmd
+
+	LogToFile "CopyAgentYmlFile","start" ,"ins"
+	source = Session.Property("AGENT_YML_SOURCE_PATH")
+	target = Session.Property("AGENT_YML_PATH")
+    cmd = "cmd.exe /c copy /y """ & source & """ """ & target & """"
+	Set WshShell = CreateObject("WScript.Shell")
+	WshShell.run cmd , 0 , false
+
+	source = Session.Property("AGENT_ALLOWLIST_SOURCE_PATH")
+   	target = Session.Property("AGENT_ALLOWLIST_PATH")
+    cmd = "cmd.exe /c copy /y """ & source & """ """ & target & """"
+  	Set WshShell = CreateObject("WScript.Shell")
+   	WshShell.run cmd , 0 , false
+
+	Set WshShell = Nothing
+	Delay(3)
+	LogToFile "CopyAgentYmlFile","end" ,"ins"
+end function
+
+'Edit acc.yml. Set MID, user and password.
+function EditAgentYml()
+	Dim agentYmlFilePath, midServerName, midServerPort, midUserName, midPassword, stringToReplace, stringToSeek, powerShellStringToSeek
+
+	LogToFile "EditAgentYml","start" ,"ins"
+	agentYmlFilePath = Session.Property("AGENT_YML_PATH")
+	midServerName = Session.Property("MIDSERVERNAME")
+	midServerPort = Session.Property("MIDSERVERPORT")
+	midApiKey = Session.Property("MIDSERVERAPIKEY")
+
+	stringToSeek = " - ""wss://127.0.0.1:8800/ws/events""" ' The exact line from the acc.yml.example file
+
+    'From silent install
+    If Session.Property("UILevel") = "2" Then
+        ' First set the Disable PowerShell
+        If Session.Property("ACC_DISABLE_POWERSHELL") = "True" Then
+            LogToFile "Installation is set to disable powershell, setting parameter to config file", "info", "ins"
+            powerShellStringToSeek = "disable-powershell: false"
+            stringToReplace = "disable-powershell: true"
+            FindAndReplaceAndWriteIfNotFound agentYmlFilePath, powerShellStringToSeek, stringToReplace, True
+        End If
+        ' Adding this check in order to not mess with API key or MID details
+        If Session.Property("CONNECT_WITHOUT_MID") <> "true" Then
+            stringToReplace = Session.Property("ACC_MID")
+		    midApiKey = Session.Property("ACC_API_KEY")
+
+            LogToFile "Silent install - Edit YML File, got the following info ACC_MID="& stringToReplace & ". ACC_API_KEY=********************************" ,"info", "ins"
+
+            ' In case ACC_MID is comma separated values, extract MIDs URLs so we can write them in the acc.yml file
+            ' This will allow us in silent mode to have multiple MID servers configured which will allow
+            ' Auto MID selection to have more than 1 MID to connet to the instance so it can get a list of all supported MIDs.
+            ' Input: ws://127.0.0.1:8800/ws/events, ws://AAAAAA:8800/ws/events, ws://ZZZZZ:8800/ws/events
+            ' Output: - "ws://127.0.0.1:8800/ws/events"
+            '         - "ws://AAAAAA:8800/ws/events"
+            '         - "ws://ZZZZZ:8800/ws/events"
+            stringToReplace = getMultipleConnectionString(stringToReplace)
+            LogToFile "Replace: " & stringToSeek & " with: " & stringToReplace, "start", "ins"
+            LogToFile "Replace", "end", "ins"
+        End If
+    Else
+        stringToReplace = " - wss://"& midServerName &":" & midServerPort & "/ws/events"
+    End If
+
+    ' If the agent installation is set to run without MID, set parameters accordingly
+    if Session.Property("CONNECT_WITHOUT_MID") <> "true" Then
+	    FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+
+	    Set stringToReplace = Nothing
+	    Set stringToSeek = Nothing
+	    stringToSeek = "api-key: """""
+	    stringToReplace = "api-key: """ & midApiKey & """"
+	    FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+	Else
+	    LogToFile "Replace parameters for connection without MID Server", "start", "ins"
+	    connectWithoutMid = Session.Property("CONNECT_WITHOUT_MID")
+	    instanceUrl = Session.Property("INSTANCE_URL")
+	    registrationKey = Session.Property("REGISTRATION_KEY")
+	    cnc = Session.Property("ACC_CNC")
+	    cnc = getMultipleConnectionString(cnc)
+	    FindAndReplace agentYmlFilePath, stringToSeek, cnc
+
+        Set stringToReplace = Nothing
+        Set stringToSeek = Nothing
+        stringToSeek = "#connect-without-mid: true"
+        stringToReplace = "connect-without-mid: true"
+        FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+
+        stringToSeek = "#instance-url: """""
+        stringToReplace = "instance-url: """ & instanceUrl & """"
+        FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+
+        stringToSeek = "#registration-key: """""
+        stringToReplace = "registration-key: """ & registrationKey & """"
+        FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+        ' Comment out api-key parameter and auto-mid-selection
+        stringToSeek = "api-key: """""
+        stringToReplace = "#api-key: """""
+        FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+
+        stringToSeek = "enable-auto-mid-selection: true"
+        stringToReplace = "#enable-auto-mid-selection: true"
+        FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+
+        ' Switch insecure-skip-tls-verify to be false in CNC use case
+        stringToSeek = "insecure-skip-tls-verify: true"
+        stringToReplace = "insecure-skip-tls-verify: false"
+        FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+	End If
+
+   	If Session.Property("ACC_ALLOW_LIST") = "True" Then
+		stringToReplace = "allow-list: " & Session.Property("AGENT_ALLOWLIST_PATH")
+	Else
+		stringToReplace = "# allow-list: " & Session.Property("AGENT_ALLOWLIST_PATH")
+    End If
+	stringToSeek = "allow-list:"
+	FindAndReplace agentYmlFilePath, stringToSeek, stringToReplace
+
+	LogToFile "EditAgentYml","end" ,"ins"
+end function
+
+Function getMultipleConnectionString(connections)
+    Dim connectionArray ,connectionstr, connectionUrl, connectioni
+
+    connections = Replace(connections, Chr(34), "") ' remove quotes if any
+    connectionArray = Split(connections, ",")
+
+    For Each connectioni In connectionArray
+        connectionUrl = Trim(connectioni)
+
+        If (Len(connectionUrl) > 0) AND (InStr(connectionstr,"- " & connectionUrl) < 1) Then
+            connectionstr = connectionstr & " - """ & connectionUrl & """" & vbCrLf
+        End If
+    Next
+
+    connectionstr = Left(connectionstr, Len(connectionstr) - 2) ' Remove the last new line
+
+    getMultipleConnectionString = connectionstr
+End Function
+
+'The function find (arg[1]) and replace string(arg[2]) in file (arg[0])
+function FindAndReplace(strFilename, strFind, strReplace)
+    FindAndReplaceAndWriteIfNotFound strFilename, strFind, strReplace, False
+end function
+
+'The function find (arg[1]) and replace string(arg[2]) in file (arg[0]) - if not found and writeIfNotFound is true, write to the end of the file
+function FindAndReplaceAndWriteIfNotFound(strFilename, strFind, strReplace, writeIfNotFound)
+	Set fso = CreateObject("Scripting.FileSystemObject")
+	Set inputFile = fso.OpenTextFile(strFilename, 1)
+    outputContent = ""
+    isFound = False
+
+	Do Until inputFile.AtEndOfStream
+		x = inputFile.ReadLine
+		If InStr(x, strFind) Then
+			x = strReplace
+            isFound = True
+		End If
+		outputContent = outputContent & x & vbCrLf
+	Loop
+
+    If isFound = False And writeIfNotFound = True Then
+        outputContent = outputContent & strReplace & vbCrLf
+    End if
+
+    inputFile.Close
+    Set inputFile = Nothing
+
+    Set outputFile = fso.OpenTextFile(strFilename, 2, true)
+	outputFile.Write outputContent
+
+    outputFile.Close
+    Set outputFile = Nothing
+end function
+
 function InstallService()
 	Dim WshShell, binPath, serviceConf, serviceLog, serviceDisplayName, serviceName, serviceDescription, cmd, userName, userString, password, logSafeFullStr
 
@@ -92,3 +640,1070 @@ function InstallService()
 
 	LogToFile "InstallService","end" ,"ins"
 end function
+
+function RunAssocRubyCommand()
+	Dim WshShell, installFolder
+	LogToFile "RunAssocRubyCommand","start" ,"ins"
+
+	installFolder = Session.Property("PROJECTLOCATION")
+
+	Set WshShell = CreateObject("WScript.Shell")
+	cmd =   "cmd.exe /c assoc .rb=RubyScript"
+	WshShell.run cmd, 0, false
+	LogToFile "After RubyScript assoc ","info", "ins"
+
+	cmd =   "cmd.exe /c ftype RubyScript=""" & installFolder & "\embedded\bin\ruby.exe"" ""%1"" %* "
+	WshShell.run cmd, 0, false
+	LogToFile "After RubyScript run ","info", "ins"
+	Set WshShell = Nothing
+	LogToFile "RunAssocRubyCommand","end" ,"ins"
+end function
+
+function AddUser(userName)
+    ' this function handles default user creation, creating passwd and creating user
+	Dim password
+	LogToFile "AddUser - " &userName,"start","ins"
+
+	Session.Property("CREATE_USER_FAILED") = "100"
+	Set wshShell = CreateObject( "WScript.Shell" )
+
+	password = Session.Property("LOCALUSERPASSWORD")
+	If password = "" Then
+   		password = GeneratePassword()
+   		Session.Property("LOCALUSERPASSWORD") = password
+		AddUserSilent()
+    End If
+
+   	AddUserToLocalGroup (userName)
+
+	Set wshShell = nothing
+	LogToFile "AddUser","end","ins"
+end function
+
+function AddUserToLocalGroup(userName)
+    ' this function creates new localgroup, add the user to it, add it to a 2nd localgroup
+	Dim groupName, groupDescription, command
+	LogToFile "AddUserToLocalGroup","start","ins"
+	groupName = Session.Property("GROUPNAME")
+	groupDescription = Session.Property("GROUPDESCRIPTION")
+	Set WshShell = CreateObject("WScript.Shell")
+
+    'Add "ServiceNow Users" group
+	command = "net localgroup """ & groupName & """ /add /comment:""" & groupDescription & """"
+	Set WshShellExec = WshShell.Exec(command)
+	LogGroupCommands WshShellExec , "Failed to create new localgroup " &groupName
+	Delay(3)
+
+    'Add the local group to local security policies.
+	'Add ServiceNow Users group to "Logon as a Service" local security policy
+	EditGroupToPolicyStatus = EditGroupToPolicy(groupName, "SeServiceLogonRight", "add", "ins", "group")
+	if EditGroupToPolicyStatus = 0 Then
+		 LogToFile "Local user was created successfully, but was not added to the local security policy, 'Log on as a service'.","error_d","ins"
+		 Exit Function
+	End if
+
+	'Add ServiceNow Users group to "Debug Program" local security policy
+	EditGroupToPolicyStatus = EditGroupToPolicy(groupName, "SeDebugPrivilege", "add", "ins", "group")
+	if EditGroupToPolicyStatus = 0 Then
+		 LogToFile "Local user was created successfully, but was not added to the local security policy, 'Debug Program'.","error_d","ins"
+		 Exit Function
+	End if
+
+    'Add user to the "ServiceNow Users" local group
+	command = "net localgroup """ & groupName & """ """ & userName & """ /add"
+	Set WshShellExec = WshShell.Exec(command)
+	LogGroupCommands WshShellExec , "Failed to add local user to localgroup " &groupName
+
+	groupName = "Performance Monitor Users"
+	command = "net localgroup """ & groupName & """ """ & userName & """ /add"
+	Set WshShellExec = WshShell.Exec(command)
+	LogGroupCommands WshShellExec , "Failed to add local user to localgroup " &groupName
+
+	Set WshShell = nothing
+	Set WshShellExec = nothing
+	LogToFile "AddUserToLocalGroup","end","ins"
+end function
+
+
+function AddUserSilent
+    ' this function is used to add the new user
+	Dim WshShell, userName, password,  command
+
+	LogToFile "AddUserSilent","start","ins"
+	userName = Session.Property("LOCALUSERNAME")
+	password = Session.Property("LOCALUSERPASSWORD")
+
+	If userName = "" Then
+		userName = Session.Property("DEFAULTUSERNAME")
+		Session.Property("LOCALUSERNAME") = userName
+	End If
+
+   	If password = "" Then
+   		password = GeneratePassword()
+   		Session.Property("LOCALUSERPASSWORD") = password
+	End If
+
+	Set colAccounts = GetObject("WinNT://127.0.0.1")
+	Set objUser = colAccounts.Create("user", userName)
+	objUser.SetPassword password
+	on error resume next
+	objUser.SetInfo
+
+	If Err.Number <> 0 Then
+		LogToFile "Error setting user info. This can occur due to mismatch in installed user and configured service user.", "info", "ins"
+		Err.Clear
+	End If
+
+	denyLocalLogon = Session.Property("DENY_LOCAL_LOGON")
+	If denyLocalLogon = "True" Then
+		LogToFile "Setting Deny Local Logon for user", "info", "ins"
+		Call EditGroupToPolicy(userName, "SeDenyInteractiveLogonRight", "add", "ins", "user")
+	End If
+
+	passwordNeverExpires = Session.Property("PASSWORD_NEVER_EXPIRES")
+	If passwordNeverExpires = "True" Then
+		LogToFile "Setting password never expires for user", "info", "ins"
+		' Hex Constant for passwordNeverExpires flag in the user profile
+		Const ADS_UF_DONT_EXPIRE_PASSWD = &H10000
+		' A given user has a set of flags with their user profile, the Or operation will set the flag specified
+		' after the new set of flags has been calculated they are set using the same objUser variable that was
+		' used to establish password
+		oldFlags = objUser.Get("UserFlags")
+		newFlags = oldFlags Or ADS_UF_DONT_EXPIRE_PASSWD
+		objUser.Put "UserFlags", newFlags
+		' On error resume next is here in the event that SetInfo has hard error, a hard error should be handled as to not crash installer
+		on error resume next
+		objUser.SetInfo
+		If Err.Number <> 0 Then
+			LogToFile "Error setting user info. This can occur due to mismatch in installed user and configured service user.", "info", "ins"
+			Err.Clear
+		End If
+	End If
+
+	Set WshShell = Nothing
+    Session.Property("CREATE_USER_FAILED") = "100"
+	LogToFile "AddUserSilent","end","ins"
+end function
+
+function CheckIfUserExists()
+	LogToFile "CheckIfUserExists","start","ins"
+	Set WshShell = CreateObject("WScript.Shell")
+	userName = Session.Property("LOCALUSERNAME")
+    if (userName = "SYSTEM") Then
+        LogToFile "No need to check System account", "info","ins"
+		Exit Function
+    End if
+
+	if (userName = "NT AUTHORITY\LOCAL SERVICE") Then
+		LogToFile "No need to check Local Service account", "info","ins"
+		Exit Function
+	End if
+
+	If userName <> "servicenow" Then
+		LogToFile "User servicenow was not chosen, not going to check for existence of user and continuing installation", "info","ins"
+		Exit Function
+	End If
+
+	command = "net user servicenow"
+    Set WshShellExec = WshShell.Exec(command)
+
+    strOutput = WshShellExec.StdErr.ReadAll
+
+    Set objRE = New RegExp
+        'check if the command result contains the below message \
+        ' if it does the servicenow user does not exist and the installation can continue
+    With objRE
+        .Pattern    = "(.*)The user name could not be found(.*)"
+        .IgnoreCase = True
+        .Global     = False
+    End With
+
+    Set objMatch = objRE.Execute( strOutput )
+
+    If objMatch.Count = 0 Then
+            Session.Property("CREATE_USER_FAILED") = "5"
+            LogToFile "User servicenow already exists, unable to continue installation", "error_d","ins"
+    End if
+	LogToFile "CheckIfUserExists","end","ins"
+end function
+
+function RemoveInheritance()
+	Dim WshShell, programDataRootFolder, groupOrUser, subFolder
+
+	LogToFile "RemoveInheritance","start" ,"ins"
+
+	programDataRootFolder = Session.Property("PROGRAM_DATA_ROOT")
+	' In upgrade we may not have the PROGRAM_DATA_ROOT parameter set on the session
+	If Len(programDataRootFolder) = 0 Then
+		LogToFile "Did not receive PROGRAM_DATA_ROOT on the session, setting to default: C:\ProgramData\ServiceNow\","info", "ins"
+		programDataRootFolder = "C:\ProgramData\ServiceNow\"
+	End If
+	subFolder = "agent-client-collector"
+	certFolder = subFolder & "\config\cert"
+
+	Set WshShell = CreateObject("WScript.Shell")
+
+	' this command disables inheritance on the Program Data root folder
+	cmd =  "cmd.exe /c icacls " & programDataRootFolder & " /inheritance:d"
+	LogToFile cmd ,"info", "ins"
+	WshShell.run cmd , 0, False
+	LogToFile "After icacls inheritance disable on " & programDataRootFolder,"info", "ins"
+
+	' this command removes access to the Program Data root folder from the Users group
+	cmd =  "cmd.exe /c icacls " & programDataRootFolder & " /remove:g Users"
+	LogToFile cmd ,"info", "ins"
+	WshShell.run cmd , 0, False
+	LogToFile "After icacls  remove access for Users on " & programDataRootFolder,"info", "ins"
+
+	userName = Session.Property("LOCALUSERNAME")
+	if (userName = "SYSTEM") then
+		LogToFile "No need to check System account", "info","ins"
+		Exit Function
+	end if
+
+	if (userName = "NT AUTHORITY\LOCAL SERVICE") then
+		' if we are installing as Local Service, use Local Service when adding permissions in icacls calls since
+		' we do not create ServiceNow Users in this case
+		groupOrUser = userName
+	else
+		groupOrUser = Session.Property("GROUPNAME")
+	end if
+
+	' this command provides the specified user or group full access to the agent-client-collector subfolder
+	cmd = "cmd.exe /c icacls """ & programDataRootFolder & subFolder & """ /grant:r """ & groupOrUser & """:f /t"
+	LogToFile cmd ,"info", "ins"
+	WshShell.run cmd , 0, False
+	LogToFile "After icacls add group to ProgramData sub folder: " & programDataRootFolder & subFolder,"info", "ins"
+
+
+	' This command enables read only inheritance for the certification folder: each file copied to this folder, the specified group or user will be added as Read only automatically
+	cmd = "cmd.exe /c icacls """ & programDataRootFolder & certFolder & """ /grant:r """ & groupOrUser & """:(oi)(ci)r /t"
+	LogToFile cmd ,"info", "ins"
+	WshShell.run cmd , 0, False
+	LogToFile "After icacls  cert read addition ","info", "ins"
+
+	Set WshShell = Nothing
+	LogToFile "RemoveInheritance","end" ,"ins"
+end function
+
+' This method fixes old installations where we might have users profiles still configured
+function RemoveOldUsersProfile()
+    RemoveUsersProfilesAndFolders false
+end function
+
+function RemoveUser()
+	LogToFile "RemoveUser","start","u"
+	userName = Session.Property("LOCALUSERNAME")
+	LogToFile "Removing user " &userName ,"info" ,"u"
+    ' Only removing the user we created
+	if(userName <> Session.Property("DEFAULTUSERNAME")) then
+        LogToFile "User " &userName & " Is not the default user(" & Session.Property("DEFAULTUSERNAME") & ") - skip deletion" ,"info" ,"u"
+        LogToFile "RemoveUser","end","u"
+        Exit function
+    end if
+
+	LogToFile "Removing Deny Local Logon for user", "info", "u"
+	Call EditGroupToPolicy(userName, "SeDenyInteractiveLogonRight", "remove", "u", "user")
+
+    ' First: Check that the user exist
+    on error resume next
+    set colAccounts=getobject("WinNT://127.0.0.1/" & username & ",user")
+    if err.number<>0 then
+        LogToFile "The user account " & userName & " does not exist." ,"info", "u"
+        LogToFile "RemoveUser","end","u"
+        Err.Clear
+        Exit Function
+    end if
+
+    ' Delete the user
+    Set objComputer = GetObject("WinNT://127.0.0.1")
+    objComputer.Delete "user", userName
+
+    if err.number<>0 then
+        LogToFile "Error deleting account: " & userName & ". Error=" & err.Source  & ":"  & Err.Description,"error_i","u"
+        Err.Clear
+        Exit Function
+    end if
+
+    ' Delete user profile from registry (HKEY_USERS and HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList) and the profile folders
+    RemoveUsersProfilesAndFolders true
+
+    LogToFile "After remove local user "&userName,"info", "u"
+	LogToFile "RemoveUser","end","u"
+end function
+
+function getSidForUser(userName)
+    Const wbemFlagReturnImmediately = &h10
+    Const wbemFlagForwardOnly = &h20
+    Dim WshNetwork, objWMIService, colItems, objItem, domainName
+
+    LogToFile "Getting SID for user=" & userName,"info", "ins"
+
+    domainName = ""
+
+    If InStr(userName, "\") > 0 Then
+        ' domain\user
+        domainName = Mid(userName, 1, InStr(userName, "\") - 1)
+        userName = Mid(userName, InStr(userName, "\") + 1)
+    ElseIf InStr(userName, "@") > 0 Then
+        ' user@domain
+        domainName = Mid(userName, InStr(userName, "@") + 1)
+        userName = Mid(userName, 1, InStr(userName, "@") - 1)
+    End If
+
+    query = "SELECT * FROM Win32_UserAccount "&_
+    "WHERE Name=""" & userName& """"
+
+    if (domainName <> "" AND domainName <> ".") Then
+        query = query & " AND Domain=""" & domainName & """"
+    Else
+        query = query & " AND LocalAccount=true"
+    End if
+
+    Set objWMIService = GetObject("winmgmts:\\.\root\CIMV2")
+    Set colItems = objWMIService.ExecQuery(query, "WQL", _
+    wbemFlagReturnImmediately + wbemFlagForwardOnly)
+
+    For Each objItem In colItems
+        getSidForUser = objItem.SID
+    Next
+end function
+
+function RemoveUsersProfilesAndFolders(shouldRemoveExistingUser)
+    LogToFile "RemoveUsersProfilesAndFolders with shouldRemoveExistingUser=" & shouldRemoveExistingUser,"start" ,"u"
+
+    userSid = ""
+    if (shouldRemoveExistingUser = true) then
+        ' Get servicenow user SID
+        userSid = getSidForUser(Session.Property("LOCALUSERNAME"))
+    end if
+
+    ' Removing the user profiles
+    RemoveUserProfilesAndFoldersUsingRegistry shouldRemoveExistingUser, userSid
+
+    LogToFile "RemoveUsersProfilesAndFolders","end" ,"u"
+end function
+
+function RemoveUserProfilesAndFoldersUsingRegistry(shouldRemoveUserSid, userSid)
+    ' Get the registry object
+    Set reg = GetObject("winmgmts://./root/default:StdRegProv")
+    Const HKEY_LOCAL_MACHINE = &H80000002
+    profileListRegKeyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+
+    reg.EnumKey HKEY_LOCAL_MACHINE, profileListRegKeyPath, arrSubKeys
+    ' If couldn't find anything - return
+    If IsNull(arrSubKeys) Then
+        LogToFile "Could not find anything under HKEY_LOCAL_MACHINE\" & profileListRegKeyPath & " - exiting RemoveUserProfilesAndFoldersUsingRegistry"  ,"info", "u"
+        exit function
+    end if
+
+    ' Get hostname for regex
+    Set wshNetwork = CreateObject( "WScript.Network" )
+    strComputerName = wshNetwork.ComputerName
+    ' Set regex to find all servicenow users on local host
+    Set serviceNowUserRegex = New RegExp
+    serviceNowUserRegex.IgnoreCase = true
+    serviceNowUserRegex.Global = true
+    ' This pattern will test true on the following (assuming that the hostname = ECLIP-MACH-WIN2):
+    ' C:\Users\servicenow
+    ' D:\Users\servicenow.ECLIP-MACH-WIN2
+    ' C:\AnotherFolder\servicenow.ECLIP-MACH-WIN2.000
+    serviceNowUserRegex.Pattern = ".*\\servicenow(?:\." + strComputerName + "(?:\.\d+)*)?$"
+    ' Set shell for deleting
+    Set WshShell = CreateObject("WScript.Shell")
+
+    For Each regKeySid In arrSubKeys
+        profileImagePathRegKeyPath = profileListRegKeyPath & "\" & regKeySid
+        ' Get a specific value
+        reg.GetExpandedStringValue HKEY_LOCAL_MACHINE, profileImagePathRegKeyPath, "ProfileImagePath", profileImagePath
+        if serviceNowUserRegex.Test(profileImagePath) Then
+            ' Check if we should skip removing the input User SID
+            if shouldRemoveUserSid = true OR regKeySid <> userSid then
+                LogToFile "Deleting the registry profile " & profileImagePathRegKeyPath & " with profileImagePath=" & profileImagePath  ,"info", "u"
+                ret = reg.DeleteKey(HKEY_LOCAL_MACHINE, profileImagePathRegKeyPath)
+                if ret <> 0 Then
+                    LogToFile "There was an issue removing the registry key: " & profileImagePathRegKeyPath ,"error_i","u"
+                else
+                    LogToFile "Registry profile " & profileImagePathRegKeyPath & " deleted successfully"  ,"info", "u"
+                end if
+                ' Remove folders
+                cmd =  "cmd.exe /c rd /s /q " & profileImagePath ' Not using deleteAllFilesAndSubFolders function as it results in permission denied for some files and folder
+                LogToFile "Deleting the folder " & profileImagePath & " using the command: cmd.exe /c rd /s /q " & profileImagePath  ,"info", "u"
+                WshShell.run cmd, 0, false
+                ' Make sure that the HKEY_USERS is also empty. This should be empty when removing the user, but sometimes there are left over.
+                deleteUserFromRegistry(regKeySid)
+            Else
+                LogToFile "Skipping removing of current user with sid=" & userSid,"info", "u"
+            end if
+        End If
+    Next
+
+    set WshShell = Nothing
+end function
+
+function deleteUserFromRegistry(userSid)
+    ret = deleteRegistryPathOnHKEY_USERS(userSid)
+    if ret <> 0 then
+        LogToFile "Could not deleted path = " & userSid  & " on HKEY_USERS" ,"error_i","u"
+    Else
+        LogToFile "The user path " &userSid & " on HKEY_USERS - was deleted successfully" ,"info" ,"u"
+    End If
+
+    ' Now try to delete the classes path for the user
+    ret = deleteRegistryPathOnHKEY_USERS(userSid & "_Classes")
+    if ret <> 0 then
+        LogToFile "Could not deleted path = " & userSid & "_Classes on HKEY_USERS" ,"error_i","u"
+    Else
+        LogToFile "The user classes path " &userSid & "_Classes on HKEY_USERS - was deleted successfully" ,"info" ,"u"
+    End If
+end function
+
+function deleteRegistryPathOnHKEY_USERS(path)
+    deleteRegistryPathOnHKEY_USERS = 0
+    Const HKEY_USERS = &H80000003
+    Set userReg = GetObject("winmgmts://./root/default:StdRegProv")
+    userReg.EnumKey HKEY_USERS, path, arrSubKeys
+    If IsNull(arrSubKeys) Then
+        Exit Function
+    End If
+
+    LogToFile "Found path " &path & " on HKEY_USERS - trying to remove it..." ,"info" ,"u"
+
+    deleteRegistryPathOnHKEY_USERS = userReg.DeleteKey(HKEY_USERS, path)
+end function
+
+function RemoveGroup()
+	Dim WshShell, groupName
+	LogToFile "RemoveGroup","start" ,"u"
+	groupName = Session.Property("GROUPNAME")
+	userName = Session.Property("LOCALUSERNAME")
+
+    if (userName = "SYSTEM") then
+        LogToFile "No need to remove SYSTEM user from groups.","info","u"
+        exit function
+    end if
+
+	if (userName = "NT AUTHORITY\LOCAL SERVICE") then
+		LogToFile "No need to remove Local Service user from groups.","info","u"
+		exit function
+	end if
+
+	LogToFile "Remove group policy info","info", "u"
+	'Remove the local group to local security policies.
+    'Remove ServiceNow Users group to "Logon as a Service" local security policy
+    EditGroupToPolicyStatus = EditGroupToPolicy(groupName, "SeServiceLogonRight", "remove", "u", "group")
+    if EditGroupToPolicyStatus = 0 Then
+         LogToFile "Local user was removed successfully, but was not remove from the local security policy, 'Log on as a service'.","error_d","u"
+         Exit Function
+    End if
+
+    'Add ServiceNow Users group to "Debug Program" local security policy
+    EditGroupToPolicyStatus = EditGroupToPolicy(groupName, "SeDebugPrivilege", "remove", "u", "group")
+    if EditGroupToPolicyStatus = 0 Then
+         LogToFile "Local user was removed successfully, but was not removed to the local security policy, 'Debug Program'.","error_d","u"
+         Exit Function
+    End if
+
+	Set WshShell = CreateObject("WScript.Shell")
+	cmd =  "cmd.exe /c net localgroup /delete """ & groupName & """"
+	WshShell.run cmd , 0, False
+
+	groupName = "Performance Monitor Users"
+	cmd =  "cmd.exe /c net localgroup """ & groupName &""" """ &userName & """ /delete "
+	WshShell.run cmd , 0, False
+
+	LogToFile "After local group deletion run ","info", "u"
+	Set WshShell = Nothing
+	LogToFile "RemoveGroup","end" ,"u"
+end function
+
+function StopService(isUninstall)
+	HandleService "false", isUninstall
+end function
+
+function RemoveService()
+	Dim WshShell, serviceName, cmd
+
+	LogToFile "RemoveService","start" ,"u"
+
+	Set WshShell = CreateObject("WScript.Shell")
+	serviceName = Session.Property("SERVICE_NAME")
+
+	LogToFile "Removing service " & serviceName,"info", "u"
+	cmd =  "cmd.exe /C sc delete " & serviceName
+	WshShell.run cmd , 0, False
+	LogToFile "After service deletion ","info", "u"
+	Set WshShell = Nothing
+
+	LogToFile "RemoveService","end" ,"u"
+end function
+
+
+function Delay( seconds )
+	Dim wshShell, strCmd
+	Set wshShell = CreateObject( "WScript.Shell" )
+	strCmd = wshShell.ExpandEnvironmentStrings( "%COMSPEC% /C (TIMEOUT.EXE /T " & seconds & " /NOBREAK)" )
+	wshShell.Run strCmd, 0, 1
+	Set wshShell = Nothing
+end function
+
+function ValidateMidProperties()
+	Dim midServerName, midServerPort, midApiKey
+
+	midServerName = Session.Property("MIDSERVERNAME")
+	midServerPort = Session.Property("MIDSERVERPORT")
+	midApiKey = Session.Property("MIDSERVERAPIKEY")
+
+	If midServerName = "" OR midServerPort = "" OR midApiKey = "" Then
+		Session.Property("MID_VALIDATION_FAILED") = "1"
+	ElseIf NOT IsNumeric(midServerPort) Then
+		Session.Property("MID_VALIDATION_FAILED") = "2"
+    ElseIf CLng(midServerPort) < 1 OR CLng(midServerPort) > 65535 Then
+		Session.Property("MID_VALIDATION_FAILED") = "3"
+	Else
+		Session.Property("MID_VALIDATION_FAILED") = "0"
+	End If
+end function
+
+function getSidForLocalGroupName(groupName)
+    Set wmi = GetObject("winmgmts://./root/cimv2")
+    ' There should be only 1 local group with this name
+    qry = "SELECT SID FROM Win32_Group WHERE Name='" & groupName & "' AND LocalAccount='True'"
+    For Each group In wmi.ExecQuery(qry)
+        getSidForLocalGroupName = group.SID
+    Next
+end Function
+
+' Adds or removes a user/group to the given security policy.
+' operation must be "add" or "remove"
+' insOrUnins must be "ins" or "u", specifies whether we should log to the installation or uninstallation log
+' userOrGroup must be "user" or "group"
+function EditGroupToPolicy(groupOrUserName, localPolicy, operation, insOrUnins, userOrGroup)
+    LogToFile "EditGroupToPolicy", "start", insOrUnins
+    EditGroupToPolicy = 1 ' 1 = everything finished OK
+
+    Set filesys = CreateObject("Scripting.FileSystemObject")
+    currentSettingFilePath = createEmptyTempFile
+
+    ' write current security settings to file
+    Set WshShell = CreateObject("WScript.Shell")
+    exportCmd =  "cmd.exe /c secedit.exe /export /cfg """ &  currentSettingFilePath & """"
+    LogToFile "Exporting security settings with command: " & exportCmd, "info", insOrUnins
+
+    ' run secedit command, wait for process to finish
+    exitCodeReturn = WshShell.run(exportCmd, 0, true)
+    If exitCodeReturn <> 0 Then
+        LogToFile "Error exporting security settings: " & err, "error_i", insOrUnins
+        LogToFile "EditGroupToPolicy", "end", insOrUnins
+        EditGroupToPolicy = 0 ' indicating an error
+        exit function
+    End If
+
+    LogToFile "Exported security settings successfully", "info", insOrUnins
+
+    Set localPolicyRe = New RegExp
+    With localPolicyRe
+        .Pattern    = localPolicy & "\s*=\s*(.*)"
+        .IgnoreCase = True
+        .Global     = False
+    End With
+
+    ' read current security file and get the current local policy settings
+    currentSetting = ""
+    On Error Resume Next
+    Set currentSettingFile = filesys.OpenTextFile(currentSettingFilePath)
+
+    If err.number <> 0 Then
+        LogToFile "Could not open exported security setting file " & currentSettingFilePath & " for reading. Err=" & err, "error_i", insOrUnins
+        LogToFile "EditGroupToPolicy", "end", insOrUnins
+        EditGroupToPolicy = 0 ' indicating an error
+        err.clear
+        exit function
+    End If
+
+    Do Until currentSettingFile.AtEndOfStream
+        ' look for the policy we are trying to add or remove from
+        Set matches = localPolicyRe.Execute(currentSettingFile.ReadLine)
+        For Each match In matches
+            ' found the specified policy, grab its value
+            currentSetting = match.submatches(0)
+        Next
+    Loop
+    currentSettingFile.Close
+
+    If filesys.FileExists(currentSettingFilePath) Then
+        filesys.DeleteFile currentSettingFilePath
+    Else
+        LogToFile "Something went wrong as temp file does not exist", "error_i", insOrUnins
+        LogToFile "EditGroupToPolicy", "end", insOrUnins
+        EditGroupToPolicy = 0 ' indicating an error
+        exit function
+    End If
+
+    ' Add group SID to the security setting
+    If operation = "add" Then
+        ' On the exported text file, the group shows by its name
+        If inStr(currentSetting, groupOrUserName) Then
+            LogToFile "Account is already in current setting for local policy=" & localPolicy & "; will not add", "info", insOrUnins
+            LogToFile "EditGroupToPolicy", "end", insOrUnins
+            Exit function
+        End If
+
+        LogToFile "About to add local group/user with name=" & groupOrUserName & " to the local policy=" & localPolicy, "info", insOrUnins
+        ' For the import operation, we need the SID of the group and not the name - Get the group SID
+		If userOrGroup = "user" Then
+			sid = getSidForUser(groupOrUserName)
+		ElseIf userOrGroup = "group" Then
+        	sid = getSidForLocalGroupName(groupOrUserName)
+		Else
+			LogToFile "EditGroupToPolicy expected userOrGroup to be user or group but was " & userOrGroup, "error", insOrUnins
+		End If
+
+        ' If the security setting does NOT have the policy needed, we will add one with the local group SID
+        If Len(currentSetting) = 0 Then
+            LogToFile "Local policy=" & localPolicy & " did not have a definition in the current security policy. Creating a new defintion for group name =" & groupOrUserName & "(" & sid & ")" , "info", insOrUnins
+            newSetting = "*" & sid
+        Else
+            ' If the security setting does have the policy needed, we will prepend the local group SID
+            LogToFile "Prepend the local user/group name=" & groupOrUserName & "(" & sid & ") to the local policy=" & localPolicy, "info", insOrUnins
+            newSetting = "*" & sid & "," & currentSetting
+        End If
+        LogToFile "after adding sid to local policy: " & newSetting, "info", insOrUnins
+    Else
+        ' This block is for remove operation
+
+        ' In case we couldn't find the groupname in the current security settings - there is nothing to remove: log and exit
+        If inStr(currentSetting, groupOrUserName) = 0 Then
+            LogToFile "Local Group " & groupOrUserName & " is not present in current setting for local policy " & localPolicy & ", no need to remove", "info", insOrUnins
+            LogToFile "EditGroupToPolicy", "end", insOrUnins
+            Exit function
+        End If
+
+        LogToFile "Removing user/group " & groupOrUserName & " from local policy " & localPolicy, "info", insOrUnins
+        ' regex to replace the account name, with an optional comma afterwards
+        ' for example, if the account is "ServiceNow Users", then the regex will match
+        ' "ServiceNow Users, Group2" and "ServiceNow Users"
+        Set replaceAcccountRe = New RegExp
+        With replaceAcccountRe
+            .Pattern    = groupOrUserName & ",?"
+            .IgnoreCase = True
+            .Global     = False
+        End With
+
+        newSetting = replaceAcccountRe.replace(currentSetting, "")
+        ' In case the currentSetting="group1,ServiceNow users" after regex, newSetting="group1," - we will remove the trailing comma
+        If Right(newSetting, 1) = "," Then
+            newSetting = Left(newSetting, Len(newSetting) - 1)
+        End If
+        LogToFile "after removing sid from local policy, newSetting=: " & newSetting, "info", insOrUnins
+    End If
+
+    ' This is a fixed string required by the security import command
+    Dim outfile: outfile = ""
+    outfile = outfile & "[Unicode]" & vbCrLf
+    outfile = outfile & "Unicode=yes" & vbCrLf
+    outfile = outfile & "[Version]" & vbCrLf
+    outfile = outfile & "signature=""$CHICAGO$""" & vbCrLf
+    outfile = outfile & "Revision=1" & vbCrLf
+    outfile = outfile & "[Privilege Rights]" & vbCrLf
+    ' This the change we will introduce
+    outfile = outfile & localPolicy & " = " & newSetting & vbCrLf
+
+    newSettingFilePath = createEmptyTempFile
+    On Error Resume Next
+    Set newSettingFile = filesys.OpenTextFile(newSettingFilePath, 2) ' open for writing
+
+    If err.number <> 0 Then
+        LogToFile "Could not write to a new file " & newSettingFilePath & ". Err=" & err, "error_i", insOrUnins
+        LogToFile "EditGroupToPolicy", "end", insOrUnins
+        EditGroupToPolicy = 0 ' indicating an error
+        err.clear
+        exit function
+    End If
+
+    newSettingFile.write(outfile)
+    newSettingFile.close
+
+    seceditFilePath = Left(newSettingFilePath, InStrRev(newSettingFilePath, "\")) + "secedit.sdb" ' set the new db as a full path on the temp dir of the user
+
+    importCmd =  "cmd.exe /c secedit.exe /configure /db """ & seceditFilePath & """ /cfg """ &  newSettingFilePath & """ /areas USER_RIGHTS"
+    LogToFile "Updating security policy with command: " & importCmd, "info", insOrUnins
+    ' run secedit command, wait for process to finish
+    exitCodeReturn = WshShell.run(importCmd, 0, true)
+    If exitCodeReturn <> 0 Then
+        LogToFile "Error updating local group security policy: " & err, "error_i", insOrUnins
+        EditGroupToPolicy = 0 ' indicating an error
+    End If
+
+    If filesys.FileExists(newSettingFilePath) Then
+        filesys.DeleteFile newSettingFilePath
+    End If
+
+    If filesys.FileExists(seceditFilePath) Then
+        filesys.DeleteFile seceditFilePath
+    End If
+
+    LogToFile "EditGroupToPolicy", "end", insOrUnins
+end function
+
+function SetRubyOptEnv()
+    LogToFile "SetRubyOptEnv","start" ,"ins"
+    Const HKEY_USERS = &H80000003
+
+    if (Session.Property("FULLUSERNAME") = "SYSTEM") Then
+         LogToFile "Not setting ruby option for SYSTEM account", "info", "ins"
+         exit function
+    end if
+
+    if (Session.Property("FULLUSERNAME") = "NT AUTHORITY\LOCAL SERVICE") Then
+         LogToFile "Not setting ruby option for Local Service account", "info", "ins"
+         exit function
+    end if
+
+    LogToFile "Setting environment variable RUBYOPT=-Eutf-8 for user " & Session.Property("FULLUSERNAME"), "info", "ins"
+
+    userSid = getSidForUser(Session.Property("FULLUSERNAME"))
+    if (userSid = "") then
+        exit function
+    end if
+
+    Set reg = GetObject("winmgmts://./root/default:StdRegProv")
+    subKey = userSid & "\Environment"
+    LogToFile "Setting RUBYOPT registry value for user SID " & userSid, "info", "ins"
+    On Error Resume Next
+    reg.setStringValue HKEY_USERS, subKey, "RUBYOPT", "-Eutf-8"
+    If err.number<>0 Then
+        LogToFile "Issue setting RUBYOPT registry value for user SID " & userSid, "info", "ins"
+        Err.Clear
+    End If
+    LogToFile "SetRubyOptEnv","end" ,"ins"
+end function
+
+function CreateTempFileName(fileName )
+	Set wshShell = CreateObject( "WScript.Shell" )
+	tempDir = wshShell.ExpandEnvironmentStrings( "%TEMP%" )
+	Set wshShell = Nothing
+	CreateTempFileName = tempDir&"\"&fileName
+end function
+
+function createEmptyTempFile()
+    Dim filesys, tempname, tempfolder, tempfile
+    Set filesys = CreateObject("Scripting.FileSystemObject")
+    Set tempfolder = filesys.GetSpecialFolder(2)
+    tempname = filesys.GetTempName
+    Set tempfile = tempfolder.CreateTextFile(tempname)
+    createEmptyTempFile = tempfolder & "\" & tempname
+end function
+
+function GeneratePassword()
+    Dim upperCase, lowerCase, chars, numbers, r, i, password
+
+	upperCase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	lowerCase = "abcdefghijklmnopqrstuvwxyz"
+	numbers = "0123456789"
+	chars = "!@#$%^&*()"
+	password = ""
+
+	password = password & GenerateRandomSubString (lowerCase, 3)
+	password = password & GenerateRandomSubString (chars, 1)
+	password = password & GenerateRandomSubString (upperCase, 3)
+	password = password & GenerateRandomSubString (numbers, 3)
+	password = password & GenerateRandomSubString (chars, 2)
+	password = password & GenerateRandomSubString (lowerCase, 3)
+	password = password & GenerateRandomSubString (upperCase, 3)
+
+	GeneratePassword = password
+end function
+
+
+function GenerateRandomSubString(charsArray, subStringLength)
+	Dim r, i, charsArrayLength
+	result = ""
+
+	charsArrayLength = Int(Len(charsArray))
+
+	For i = 1 To subStringLength
+		Randomize
+		r = Int((Rnd * charsArrayLength) + 1)
+		result = result & Mid(charsArray, r, 1)
+	Next
+	GenerateRandomSubString = result
+end function
+
+Sub ensureFolderExists(strFldrPath)
+	Set FSO = CreateObject("Scripting.FileSystemObject")
+    If Not FSO.FolderExists(strFldrPath) AND strFldrPath <> "" Then
+        ensureFolderExists(FSO.GetParentFolderName(strFldrPath))
+        FSO.CreateFolder strFldrPath
+    End If
+End Sub
+
+function RemoveLogFile(install_type)
+	logFileName = GetLogFileName(install_type)
+	Set filesys = CreateObject("Scripting.FileSystemObject")
+	If filesys.FileExists(logFileName) Then
+		filesys.DeleteFile logFileName
+	End If
+	Set filesys = Nothing
+end function
+
+function GetLogFileName (install_type)
+	dim  tempDir, fileName
+	If(install_type = "ins") Then
+		fileName = "Agent_Installation.log"
+	Else
+		fileName = "Agent_UnInstall.log"
+	End If
+	tempDir = CreateObject("WScript.Shell").ExpandEnvironmentStrings("%Temp%")
+	newTempDir = removeTempDirExtenstion(tempDir)
+	ensureFolderExists(newTempDir&"\ACC_Logs")
+	GetLogFileName = newTempDir&"\ACC_Logs\"&fileName
+end function
+
+function removeTempDirExtenstion(tempDir)
+	Set objRE = New RegExp
+	With objRE
+		.Pattern    = "(.*)\\Temp\\(.*)"
+		.IgnoreCase = True
+		.Global     = False
+	End With
+	Set objMatch = objRE.Execute( tempDir )
+	If objMatch.Count = 1 Then
+		removeTempDirExtenstion = objMatch.Item(0).Submatches(0) & "\Temp"
+	else
+		removeTempDirExtenstion = tempDir
+	End If
+	Set objMatch = Nothing
+	Set objRE    = Nothing
+end function
+
+Function LogToFile(line1 , state ,install_type)
+	logFileName = GetLogFileName(install_type)
+	set logFileObj = CreateObject("Scripting.FileSystemObject")
+	Set logFile = logFileObj.OpenTextFile(logFileName, 8, True)
+
+	If( state = "start") Then
+		LogStart logFile, line1
+	ElseIf(state = "end") Then
+		LogEnd logFile, line1
+	ElseIf(state = "error_i") Then
+		LogErrorInfo logFile, line1
+	ElseIf(state = "error_d") Then
+		LogErrorDie logFile, line1
+	Else
+		LogInfo logFile, line1
+	End If
+End Function
+
+sub LogStart(logFile, line)
+	logFile.WriteLine"___________________________________________"
+	logFile.WriteLine  "Starting " &line&" "&Date&"-"&Time
+	logFile.Close
+end sub
+
+sub LogEnd(logFile, line)
+	logFile.WriteLine  "Ending " &line&" "&Date&"-"&Time
+	logFile.Close
+end sub
+
+sub LogInfo(logFile, line)
+	logFile.WriteLine  "###Info: " &line
+	logFile.Close
+end sub
+
+sub LogErrorInfo(logFile, line)
+	logFile.WriteLine  vbNewLine&"###Warning: " &line
+	logFile.Close
+end sub
+
+sub LogErrorDie(logFile, line)
+	logFile.WriteLine  vbNewLine&"###Error: " &line
+	logFile.WriteLine  "Installation was aborted due to failure."
+	logFile.WriteLine"___________________________________________"
+	logFile.Close
+end sub
+
+sub LogGroupCommands(shellObj , errMsg)
+	dim strErr, startIndex
+	strErr = shellObj.StdErr.ReadAll
+	startIndex = InStr(strErr, "System error")
+
+	If startIndex <> 0 Then
+		LogToFile errMsg, "error_i", "ins"
+	End If
+end sub
+
+function RestoreAgentConfiguration()
+	LogToFile "RestoreAgentConfiguration","start" ,"ins"
+
+	Dim WshShell
+	Set WshShell = CreateObject("WScript.Shell")
+
+	commonAgentNowAppConfFolder = Session.Property("CommonAgentNowAppConf") ' c:\ProgramData\ServiceNow\agent-client-collector\conf
+	commonAgentNowCacheFolder = Session.Property("CommonAgentNowCache")
+	commonAgentNowLogFolder = Session.Property("CommonAgentNowAppLog")
+
+	tempDir = WshShell.ExpandEnvironmentStrings("%Temp%")
+	newTempDir = removeTempDirExtenstion(tempDir)
+	backupDir = newTempDir & "\ACC_Backup"
+	confBackupDir = backupDir & "\conf"
+	ensureFolderExists(confBackupDir)
+
+	' Copy all files and folders: src, dst
+	Set fso = CreateObject("Scripting.FileSystemObject")
+	If fso.FolderExists(confBackupDir) Then
+		If Right(commonAgentNowAppConfFolder, 1) = "\" Then
+			commonAgentNowAppConfFolder = Left(commonAgentNowAppConfFolder, Len(commonAgentNowAppConfFolder) - 1) ' Remove last slash
+		End If
+		LogToFile "Restoring folder " & confBackupDir & " to " & commonAgentNowAppConfFolder, "info", "ins"
+		fso.CopyFolder confBackupDir, commonAgentNowAppConfFolder ' commonAgentNowAppConfFolder should not have a slash at the end, otherwise CopyFolder will copy the confBackupDir as a folder in commonAgentNowAppConfFolder instead of copying the files
+	End If
+
+	accIdSource = commonAgentNowCacheFolder & "agent_now_id"
+	accIdBackup = backupDir & "\agent_now_id"
+	copyFile accIdBackup, accIdSource
+
+	accKeystoreSource = commonAgentNowCacheFolder & "agent_now_keystore"
+	accKeystoreBackup = backupDir & "\agent_now_keystore"
+	copyFile accKeystoreBackup, accKeystoreSource
+
+	accLogSource = commonAgentNowLogFolder & "acc.log"
+	accLogBackup = backupDir & "\acc.log"
+	copyFile accLogBackup, accLogSource
+
+	LogToFile "RestoreAgentConfiguration","end" ,"ins"
+end function
+
+function BackupAgentConfiguration()
+	LogToFile "BackupAgentConfiguration","start" ,"ins"
+
+	Dim WshShell
+	Set WshShell = CreateObject("WScript.Shell")
+
+	commonAgentNowAppConfFolder = Session.Property("CommonAgentNowAppConf")
+	commonAgentNowCacheFolder = Session.Property("CommonAgentNowCache")
+	commonAgentNowLogFolder = Session.Property("CommonAgentNowAppLog")
+
+	tempDir = WshShell.ExpandEnvironmentStrings("%Temp%")
+	newTempDir = removeTempDirExtenstion(tempDir)
+	backupDir = newTempDir & "\ACC_Backup"
+	confBackupDir = backupDir & "\conf"
+	' Make sure the conf backup directory is empty from previous backups
+	deleteAllFilesAndSubFolders(confBackupDir)
+	' This will create the entire folder hierarchy (C:\Users\<user>\AppData\Local\Temp\ACC_Backup\conf)
+	ensureFolderExists(confBackupDir)
+
+	' Copy all files and folders: src, dst if src exist
+	Set fso = CreateObject("Scripting.FileSystemObject")
+	If fso.FolderExists(commonAgentNowAppConfFolder) Then
+		' Making sure that the commonAgentNowAppConfFolder does not end with a \, this is for fso.CopyFolder - otherwise there is an error
+		If Right(commonAgentNowAppConfFolder, 1) = "\" Then
+			commonAgentNowAppConfFolder = Left(commonAgentNowAppConfFolder, Len(commonAgentNowAppConfFolder) - 1)
+		End If
+		LogToFile "Backing up folder " & commonAgentNowAppConfFolder & " to " & confBackupDir, "info", "ins"
+		fso.CopyFolder commonAgentNowAppConfFolder, confBackupDir ' confBackupDir should not have a slash at the end, otherwise CopyFolder will copy the commonAgentNowAppConfFolder as a folder in confBackupDir instead of copying the files
+	End If
+
+	accIdSource = commonAgentNowCacheFolder & "agent_now_id"
+	accIdBackup = backupDir & "\agent_now_id"
+	copyFile accIdSource, accIdBackup
+
+	accKeystoreSource = commonAgentNowCacheFolder & "agent_now_keystore"
+	accKeystoreBackup = backupDir & "\agent_now_keystore"
+	copyFile accKeystoreSource, accKeystoreBackup
+
+	accLogSource = commonAgentNowLogFolder & "acc.log"
+	accLogBackup = backupDir & "\acc.log"
+	copyFile accLogSource, accLogBackup
+
+	LogToFile "BackupAgentConfiguration","end" ,"ins"
+end function
+
+'Function start or stop ACC service
+function HandleService(shouldStart, isUninstall)
+	Dim WshShell, serviceName, cmd, logFile
+
+	logFile = "ins"
+	if isUninstall = True Then
+		logFile = "u"
+	End If
+
+	LogToFile "Handle service","start" ,logFile
+
+	serviceName = Session.Property("SERVICE_NAME")
+	Set WshShell = CreateObject("WScript.Shell")
+	If shouldStart = "true" Then
+		LogToFile "Starting service " & serviceName, "start", logFile
+		cmd =  "cmd.exe /c sc start " & serviceName
+	Else
+		LogToFile "Stop service " & serviceName, "start", logFile
+		cmd =  "cmd.exe /c sc stop " & serviceName
+	End If
+	Set WshShellExec = WshShell.Exec(cmd)
+	Delay(5)
+
+	LogToFile "Handle service","end" ,logFile
+end function
+
+function CheckInstallService()
+	LogToFile "Check Install Service", "start", "ins"
+	Session.Property("SERVICE_ALREADY_EXISTS") = "0"
+	Dim WshShell
+    serviceName = Session.Property("SERVICE_NAME")
+    Set WshShell = CreateObject("WScript.Shell")
+    cmd = "cmd.exe /c sc query " & serviceName
+    Set WshShellExec = WshShell.Exec(cmd)
+    Do While WshShellExec.Status = 0
+         Delay(1)
+    Loop
+    res = WshShellExec.StdOut.ReadAll
+    if InStr(res, "SERVICE_NAME: " & serviceName) <> 0 Then
+        LogToFile "Service already exists, setting session property to stop installation", "info", "ins"
+		Session.Property("SERVICE_ALREADY_EXISTS") = "1"
+    End if
+end function
+
+function deleteAllFilesAndSubFolders(path)
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(path) Then
+        LogToFile "Could not find directory:" & path & "\" & Name & " - " & Err.Description, "info", "ins"
+        Exit Function
+    End If
+    Set folder = fso.GetFolder(path)
+
+    ' delete all files in root folder
+    for each f in folder.Files
+       On Error Resume Next
+       name = f.name
+       f.Delete True
+       If Err Then
+         LogToFile "Error deleting file:" & path & "\" & Name & " - " & Err.Description, "info", "ins"
+         Err.clear
+       Else
+         LogToFile "File deleted:" & path & "\" & Name, "info", "ins"
+       End If
+       On Error Resume Next
+    Next
+
+    ' delete all subfolders and files
+    For Each f In folder.SubFolders
+       On Error Resume Next
+       name = f.name
+       f.Delete True
+       If Err Then
+         LogToFile "Error deleting sub-folder:"  & path & "\" & Name & " - " & Err.Description, "info", "ins"
+         Err.clear
+       Else
+         LogToFile "Sub-folder deleted:" & path & "\" & Name, "info", "ins"
+       End If
+       On Error Resume Next
+    Next
+End Function
+
+Function copyFile(src, dst)
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If (fso.FileExists(src)) Then
+        LogToFile "Copying file " & src & " to " & dst, "info", "ins"
+        fso.CopyFile src, dst
+    End If
+End Function
